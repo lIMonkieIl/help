@@ -1,0 +1,163 @@
+services:
+  postgres:
+    image: postgres
+    container_name: cloaklink_Postgres
+    shm_size: 128mb
+    restart: unless-stopped
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB:-myapp_db}
+      - POSTGRES_USER=${POSTGRES_USER:-myappdbuser}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-myappdbpassword}
+      - PGDATA=/var/lib/postgresql/data/pgdata
+    volumes:
+      - type: bind
+        source: ./postgres-data
+        target: /var/lib/postgresql/data
+        is_directory: true
+      - type: bind
+        source: ./init-db.sql
+        target: /docker-entrypoint-initdb.d/init-db.sql
+        content: |
+          SELECT 'CREATE DATABASE :' || :'${POSTGRES_DB}'
+          WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = :'${POSTGRES_DB}')\gexec;
+          CREATE USER :'${POSTGRES_USER}' WITH PASSWORD :'${POSTGRES_PASSWORD}';
+          GRANT ALL PRIVILEGES ON DATABASE :'${POSTGRES_DB}' TO :'${POSTGRES_USER}';
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}']
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  keydb:
+    container_name: cloaklink_KeyDB
+    image: eqalpha/keydb
+    restart: unless-stopped
+    command: keydb-server /etc/keydb/keydb.conf --appendonly yes --server-threads 4 --requirepass $${KEYDB_PASSWORD}
+    volumes:
+      - type: bind
+        source: ./keydb-data
+        target: /data
+        is_directory: true
+    healthcheck:
+      test: ['CMD-SHELL', 'redis-cli -p 6379 -a $${KEYDB_PASSWORD} ping || exit 1']
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    environment:
+      - KEYDB_PASSWORD=${KEYDB_PASSWORD}
+
+  pgbouncer:
+    container_name: Cloack_Link_PgBouncer
+    image: edoburu/pgbouncer
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      - 'DB_USER=${POSTGRES_USER}'
+      - 'DB_PASSWORD=${POSTGRES_PASSWORD}'
+      - 'DB_HOST=postgres'
+      - 'DB_NAME=${POSTGRES_DB}'
+      - 'AUTH_TYPE=scram-sha-256'
+      - 'POOL_MODE=transaction'
+      - MAX_CLIENT_CONN=100
+      - DEFAULT_POOL_SIZE=20
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -h localhost -p 5432 -U $${DB_USER} -d $${POSTGRES_DB}']
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  dbgate:
+    container_name: cloaklink_Db_Gate
+    image: dbgate/dbgate
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      keydb:
+        condition: service_healthy
+    healthcheck:
+      test: ['CMD-SHELL', 'curl -f http://dbgate:3000 || exit 1']
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    environment:
+      - WEB_ROOT=${DBGATE_ROOT:-/}
+      - LOGIN=${DBGATE_LOGIN:-dbgateuser}
+      - PASSWORD=${DBGATE_PASSWORD:-dbgatepassword}
+      - CONNECTIONS=POSTGRES,KEYDB
+      - LABEL_POSTGRES=${DBGATE_POSTGRES_LABEL}
+      - SERVER_POSTGRES=postgres
+      - USER_POSTGRES=${POSTGRES_USER}
+      - PASSWORD_POSTGRES=${POSTGRES_PASSWORD}
+      - PORT_POSTGRES=5432
+      - ENGINE_POSTGRES=postgres@dbgate-plugin-postgres
+      - LABEL_KEYDB=${DBGATE_KEYDB_LABEL}
+      - SERVER_KEYDB=keydb
+      - USER_KEYDB=
+      - PASSWORD_KEYDB=${KEYDB_PASSWORD}
+      - PORT_KEYDB=6379
+      - ENGINE_KEYDB=redis@dbgate-plugin-redis
+    volumes:
+      - type: bind
+        source: ./dbgate-data
+        target: /root/.dbgate
+        is_directory: true
+
+  api:
+    container_name: cloaklink_API
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      args:
+        APP: api
+    restart: unless-stopped
+    healthcheck:
+      test: ['CMD', 'wget', '--no-verbose', '--tries=1', '--spider', 'http://api:3002/health-check']
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    environment:
+      - DATABASE_URL_POOL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@pgbouncer:5432/${POSTGRES_DB}?pgbouncer=true
+      - DATABASE_DIRECT_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+    ports:
+      - 3002:3002
+    depends_on:
+      postgres:
+        condition: service_healthy
+      pgbouncer:
+        condition: service_healthy
+      keydb:
+        condition: service_healthy
+
+  web:
+    container_name: cloaklink_WEB
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      args:
+        APP: web
+    restart: unless-stopped
+    healthcheck:
+      test: ['CMD', 'wget', '--no-verbose', '--tries=1', '--spider', 'http://web:3001']
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    ports:
+      - 3001:3001
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      - CLOAKLINK_WEB_PORT=3001
+      - CLOAKLINK_API_URL=http://api:3002
+      - CLOAKLINK_WEB_ORIGIN=${CLOAKLINK_WEB_ORIGIN}
+      - DATABASE_URL_POOL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@pgbouncer:5432/${POSTGRES_DB}?pgbouncer=true
+      - DATABASE_DIRECT_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
